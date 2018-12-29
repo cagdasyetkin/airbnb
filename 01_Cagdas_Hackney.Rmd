@@ -1,0 +1,432 @@
+---
+title: "CEU Data Analysis"
+author: "Cagdas Yetkin"
+date: '2018-12-21'
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document: default
+  html_notebook:
+    df_print: paged
+subtitle: Feature Selection, Lasso, Post Lasso (after-party)
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.path='Figs/',
+                      warning=FALSE, message=FALSE)
+
+options(warn=-1)
+```
+
+```{r}
+library(tidyverse) #The Jedi
+library(data.table) #The Sith
+
+library(ggplot2) #Obi Van Kenobi
+library(gridExtra) #combine plots
+library(ggthemes) #fivethirtyeight plots
+
+library(skimr) #magical summaries
+
+library(caret) #ML
+library(glmnet) #Lasso
+library(glmnetUtils)
+
+```
+
+```{r}
+#df <- read_csv("data/airbnb_hackney_workfile_adj.csv")
+df <- read.csv("data/airbnb_hackney_workfile_adj.csv", stringsAsFactors = TRUE)
+```
+
+Our client is a mid size real estate company trying to enter into airbnb business in London. Their new revenue model is to build or purchase flats and houses, renovate them and then list on the website. They also want to expand the business to Budapest Hungary soon.
+
+Our task is to help them on the pricing issue by using the historical data publicly available online.
+
+```{r}
+glimpse(df)
+```
+
+How does the price look like? What kind of distribution would you expect?
+```{r}
+summary(df$price)
+```
+
+After some discussion with our client it becomes obvious that we will not use any price above 700. We will drop them since we are not interested in them.
+
+```{r}
+df <- df %>%
+  filter(price < 700)
+```
+
+Where do we have missing variables?
+
+```{r}
+to_filter <- sapply(df, function(x) sum(is.na(x)))
+to_filter[to_filter > 0]
+```
+
+Since these properties will be renovated (new listings), they will not have any **review or review related scores**. Later on we can build a new model for the existing ones. However, we will drop them for this initial study.
+
+The company will outsource the cleaning activity. We will have a standardized fixed cost. In the data when the cleaning fee is missing it is actually zero. And sometimes this feature is misused by the oweners. That's why we will not use this feature.
+
+
+```{r}
+to_drop <- c("n_review_scores_rating", "n_reviews_per_month", 
+         "n_number_of_reviews", "n_days_since", "p_host_response_rate", "usd_cleaning_fee",
+         "ln_days_since","ln_days_since2", "ln_days_since3", "n_days_since2", "n_days_since3", "ln_review_scores_rating",
+         "usd_price_day", "cancellation_policy", "neighbourhood_cleansed", "property_type","room_type", "f_neighbourhood_cleansed",
+         "ln_price","ln_accommodates","ln_accommodates2","ln_beds","n_accommodates2","ln_number_of_reviews", "f_number_of_reviews",
+         "f_minimum_nights") #removing some duplicates and some vars I won't use
+
+df <- df %>%
+  select(-one_of(to_drop))
+```
+
+
+missing values of `n_bathrooms` and `n_beds`: 
+
+We will use median value for the bathrooms assuming that 1 bathroom should be available.
+Number of beds should be equal to the number of accommodate for the missing ones.
+
+```{r}
+df <- df %>%
+  mutate(n_bathrooms =  ifelse(is.na(n_bathrooms), median(n_bathrooms, na.rm = T), n_bathrooms),
+         n_beds = ifelse(is.na(n_beds), n_accommodates, n_beds))
+```
+
+We dealed with all missing values. We have factors other than numeric and binary. What are they? One hypothesis can be that the price is changing by some factors...
+
+```{r, results="hide"}
+factor_cols <- df %>% Filter(f = is.factor) %>% names()
+
+df %>%
+  select(factor_cols) %>%
+  skim()
+
+```
+
+How is the average price changing in my district by `property_type`, `room_type` and the `bed_type`? 
+
+```{r}
+df %>%
+    group_by(f_property_type, f_room_type) %>%
+    summarize(Mean = mean(price, na.rm=TRUE))
+```
+
+```{r}
+df %>%
+    group_by(f_bed_type) %>%
+    summarize(Mean = mean(price, na.rm=TRUE))
+```
+
+Looks like some significant differences. How does the price range look like?
+
+```{r, fig.width=8, fig.height=3}
+## Distribution of price by type
+plot1 <- ggplot(df, aes(price, fill = f_room_type)) + 
+         ggtitle("Price Density, Hackney") +
+         geom_density(alpha = 0.3) + theme_fivethirtyeight()
+## Boxplot of price by room type
+plot2 <- ggplot(df, aes(f_room_type, price)) + 
+         ggtitle("Price in Hackney") +
+         geom_boxplot()+ theme_fivethirtyeight()
+grid.arrange(plot1, plot2, ncol=2, nrow=1)
+```
+
+We see the skewness to the right and how price changes by property type. 
+
+```{r, fig.width=8, fig.height=5}
+plot5 <- ggplot(df, aes(x = factor(n_accommodates), y = price, fill = factor(f_property_type))) +
+         geom_boxplot(alpha=0.8) +
+         scale_x_discrete(name = "Accomodate Persons") +
+         ggtitle("Price Per Accommodate in Hackney") + theme_fivethirtyeight()
+plot6 <- ggplot(data = df) +
+         geom_bar(data = df,
+         aes(x = factor(n_accommodates),
+         color = f_room_type, fill = f_room_type)) +
+         ggtitle("# Accomodations and property types Hackney") +
+         xlab('Accommodates') + theme_fivethirtyeight()
+grid.arrange(plot5, plot6, nrow=2)
+```
+
+Accommodate is an important feature we will need to pay attention. By looking at this, it also comes to mind that creating seperate models for different numbers of `n_accomodate` can be tried.
+
+There is a wide range of price. So there must be some factors which make differences. Now I will leave the path and enter into a random forest to see which variables it picks. 
+
+This will be a heuristic approach. Because I am lacking the domain knowledge in this business, I will use random forest to pick the most important (highly likely) variables for me. It is probabilistic, however, it can be a better start than picking up randomly.
+
+```{r}
+# Fit random forest
+RFtrainControl <- trainControl(method = "cv", 
+                               number = 2, 
+                               verboseIter = TRUE)
+set.seed(1234)
+RFmodel <- train(
+  price ~ .,
+  tuneLength = 1,
+  data = df, 
+  method = 'ranger',
+  na.action = na.omit,
+  importance = 'impurity',
+  trControl = RFtrainControl)
+```
+
+```{r}
+varImp(RFmodel)
+```
+
+```{r}
+RFvars <- "n_accommodates, f_room_type, n_beds, n_bathrooms, n_guests_included, f_bathroom, d_familykidfriendly, n_minimum_nights, n_extra_people, d_tv, f_cancellation_policy, d_dryer, d_smokedetector, f_property_type, d_cabletv, d_petsallowed, d_buzzerwirelessintercom, d_smokingallowed, d_essentials, d_iron"
+
+```
+
+
+Accommodates looks like the most important variable indeed. And some dummies might have significant effect, such as:
+being kid friendly, having TV, dryer, smokedetector, cableTV, petsAllowed.
+
+We can visualize these dummies in interaction with `room_type` for average `price`. Error bars added to emphasise the level of uncertainty.
+
+In order to keep it tidy, we will first define a function and then call it to see these interactions. You can source this fuction for your other projects.
+
+```{r}
+# It is a function it takes 3 arguments: 1) Your dataframe, 
+# 2) the factor variable (like room_type) 
+# 3)the dummy variable you are interested in (like TV)
+
+Make_Interaction_Plot <- function(df, FactorVar, DummyVar){
+  #Process your df and make a new dataframe which contains the stats
+  require("dplyr")
+  FactorVar <- as.name(FactorVar)
+  DummyVar <- as.name(DummyVar)
+  
+  stats <- df %>%
+    group_by_(FactorVar, DummyVar) %>%
+    summarize(Mean = mean(price, na.rm=TRUE),
+              se = sd(price)/sqrt(n()))
+  
+  stats[,2] <- lapply(stats[,2], factor)
+  
+  #create your custom plot style
+  dodge = position_dodge(width=0.9)
+  apatheme=theme_bw()+
+    theme(panel.grid.major=element_blank(),
+          panel.grid.minor=element_blank(),
+          panel.border=element_blank(),
+          axis.line=element_line())  
+  
+  #Plot it!
+  p1 <- ggplot(stats, aes_string(colnames(stats)[1], colnames(stats)[3], fill = colnames(stats)[2]))+
+    geom_bar(stat='identity', position=dodge)+
+    geom_errorbar(aes(ymin=Mean-(1.96*se),ymax=Mean+(1.96*se)) , position=dodge, width=0.25)+
+    ylab('Mean Price')+
+    apatheme +
+    scale_fill_grey()  
+  
+  return(p1)
+}
+
+
+```
+
+
+```{r, fig.width=10, fig.height=5}
+p1 <- Make_Interaction_Plot(df, "f_room_type", "d_familykidfriendly")
+p2 <- Make_Interaction_Plot(df, "f_room_type", "d_tv")
+p3 <- Make_Interaction_Plot(df, "f_room_type", "d_dryer")
+p4 <- Make_Interaction_Plot(df, "f_room_type", "d_smokedetector")
+
+p5 <- Make_Interaction_Plot(df, "f_cancellation_policy", "d_familykidfriendly")
+p6 <- Make_Interaction_Plot(df, "f_cancellation_policy", "d_tv")
+
+p7 <- Make_Interaction_Plot(df, "f_property_type", "d_dryer")
+p8 <- Make_Interaction_Plot(df, "f_property_type", "d_smokedetector")
+
+#you can write a loop for f_ and d_ variables
+
+grid.arrange(p1, p2, p3, p4, p5, p6, p7, p8, ncol=2, nrow=4)
+
+```
+
+Please feel free to experiment on more interactions! For instance take a look at `f_bed_type`. As we can see if we add some more rows to this graphic it will get more busy. We have quite a lot possible combinations. This can really get confusing.
+
+We see here that playing our card to be-kid-friendly, we can increase our profits in Entire Home Apartments. Maybe the families with small kids are ready to pay more than young couples and singles. We will try these interactions during modeling.
+
+
+
+partitioning to training and test sets
+```{r}
+training_ratio <- 0.7
+set.seed(1234)
+train_indices <- createDataPartition(y = df[["price"]],
+                                     times = 1,
+                                     p = training_ratio,
+                                     list = FALSE)
+hackney_train <- df[train_indices, ]
+hackney_test <- df[-train_indices, ]
+```
+
+
+```{r}
+fit_control <- trainControl(method = "cv", number = 5)
+```
+
+### 1) Linear 1
+Baseline
+
+```{r}
+set.seed(1234) # The most simple one for benchmarking or comparing...
+model_1_hackney <- train(price ~ n_accommodates, 
+                   data = hackney_train, 
+                   method = "lm", 
+                   trControl = fit_control)
+```
+
+
+### 2) Linear 2
+Using Variables from Random Forest and adding some interactions we discovered above
+
+```{r}
+##get the most important variables from Random Forest model
+interactions <- "price ~ n_accommodates + f_room_type + n_beds + n_bathrooms + n_guests_included + f_bathroom + d_familykidfriendly + n_minimum_nights + n_extra_people + d_tv + f_cancellation_policy + d_dryer + d_smokedetector + f_property_type + d_cabletv + d_petsallowed + d_buzzerwirelessintercom + d_smokingallowed + d_essentials + d_iron + n_accommodates^2 + n_beds^2 + f_room_type*d_familykidfriendly + f_room_type*d_tv + n_accommodates*d_familykidfriendly + f_cancellation_policy*d_familykidfriendly"
+```
+
+
+```{r}
+set.seed(1234)
+model_2_hackney <- train(as.formula(interactions),
+                   data = hackney_train, 
+                   method = "lm", 
+                   trControl = fit_control)
+```
+
+### 3) LASSO 1
+Using a random Lambda without search
+```{r}
+#alpha is 1 to get a Lasso model
+#When Lambda = 0, then the lasso simply gives the OLS fit, and when Lambda becomes sufficiently large, the lasso gives the null model in which all coefficient estimates equal zero.
+set.seed(1234) # lasso.
+model_3_hackney <- train(price ~ .,
+                   data = hackney_train, 
+                   method = "glmnet", 
+                   metric = "RMSE",
+                   tuneGrid = expand.grid(alpha = 1,lambda = 5),
+                   trControl = fit_control)
+```
+
+
+### 4) LASSO 2
+We generate this model in order to extract its variables to help us on feature selection. Can Lasso help feature selection? Can we use those variables in a linear model and get a better performance?
+```{r}
+
+'%ni%' <- Negate('%in%')
+
+x <- model.matrix(price~.,data=hackney_train)
+x = x[,-1]
+
+set.seed(1234)
+model_4_hackney <- cv.glmnet(x=x,y=hackney_train$price,type.measure='mse',nfolds=5,alpha=1)
+
+c <- coef(model_4_hackney,s='lambda.min',exact=TRUE) #get the one with min score to extract its variables
+inds <- which(c!=0)
+variables <- row.names(c)[inds]
+variables <- variables[variables %ni% '(Intercept)']
+
+variables
+```
+
+I want to get a list of variables (`LV`) to feed them into my linear model later.
+
+```{r}
+LV = c()
+for (i in variables) { #for all the variables in this lasso
+  for (j in names(df)) { #for all the variables in the original df
+    if (substring(i, 1, 10) == substring(j, 1, 10)) { #if the first 10chars are equal 
+      if (!(j %in% LV)) { # if it is not already in the list
+        LV <- c(LV, j) #then use the name in the original df
+      }
+    }
+  }
+}
+LV
+```
+
+These are the equivalent names in the original df which I can use in a linear model
+
+```{r}
+length(names(df))-1 #How many variables did we have in the df?
+```
+
+
+```{r}
+LassoVars <- paste(LV, collapse="+") 
+```
+
+
+### 5) Linear 3
+using the variables we found in Lasso
+```{r}
+set.seed(1234)
+model_5_hackney <- train(as.formula(paste("price ~ ", LassoVars)), 
+                   data = hackney_train, 
+                   method = "lm", 
+                   trControl = fit_control)
+```
+
+
+Cross Validation RMSEs
+```{r}
+model_1_hackney_rmse_cv <- round(model_1_hackney$results[["RMSE"]],2)
+model_2_hackney_rmse_cv <- round(model_2_hackney$results[["RMSE"]],2)
+model_3_hackney_rmse_cv <- round(model_3_hackney$results[["RMSE"]],2)
+model_5_hackney_rmse_cv <- round(model_5_hackney$results[["RMSE"]],2)
+
+```
+
+How do these models behave on test sets? 
+
+```{r}
+newx = matrix(hackney_test[,-1])
+
+#hackney model predictions on test set
+model_1_hackney_pred_test <- predict(model_1_hackney, newdata = hackney_test)
+model_2_hackney_pred_test <- predict(model_2_hackney, newdata = hackney_test)
+model_3_hackney_pred_test <- predict(model_3_hackney, newdata = hackney_test)
+model_5_hackney_pred_test <- predict(model_5_hackney, newdata = hackney_test)
+
+#hackney model rmse on test set
+model_1_hackney_rmse_test <- round(RMSE(model_1_hackney_pred_test, hackney_test$price),2)
+model_2_hackney_rmse_test <- round(RMSE(model_2_hackney_pred_test, hackney_test$price),2)
+model_3_hackney_rmse_test <- round(RMSE(model_3_hackney_pred_test, hackney_test$price),2)
+model_5_hackney_rmse_test <- round(RMSE(model_5_hackney_pred_test, hackney_test$price),2)
+```
+
+
+
+```{r}
+frame <- matrix(c( "Linear", model_1_hackney_rmse_cv, 
+                   model_1_hackney_rmse_test, 
+
+                   "Linear2", model_2_hackney_rmse_cv, 
+                   model_2_hackney_rmse_test, 
+                   
+                   "Lasso", model_3_hackney_rmse_cv, 
+                   model_3_hackney_rmse_test,
+                   
+                   "Linear using Lasso Vars", model_5_hackney_rmse_cv, 
+                   model_5_hackney_rmse_test
+                   ), 
+                   
+                  nrow= 4, byrow= TRUE)
+colnames(frame) <- c('model', 'Hackney CV', "Hackney Test")
+result_table <- data.frame(frame)
+
+result_table %>%
+  pander::pander()
+```
+
+
+
+
+
